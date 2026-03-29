@@ -15,122 +15,106 @@ import numpy as np
 from tqdm import tqdm
 
 
-def compute_ppr(loader, alpha=0.85, beta=0.8, n_iter=20, batch_size=128):
-    """Compute per-user PPR scores over the full knowledge graph.
+def compute_ppr(loader, topk, alpha=0.85, beta=0.8, n_iter=20, batch_size=128):
+    """Compute per-user PPR scores on GPU, keep top-k per user, return CPU tensors.
 
-    Returns the full dense [n_users, n_nodes] tensor (before top-k truncation).
+    The entire pipeline (transition matrix, power iteration, top-k truncation)
+    runs on GPU.  Only the final sparse top-k results are moved to CPU.
+
+    Returns
+    -------
+    topk_indices : LongTensor [n_users, topk]  (CPU)  node ids
+    topk_values  : Tensor     [n_users, topk]  (CPU)  PPR scores
     """
-    tkg = torch.LongTensor(loader.tKG).cuda()
+    device = torch.device('cuda')
+
+    tkg = torch.LongTensor(loader.tKG).to(device)
     n_nodes = loader.n_nodes
     n_users = loader.n_users
+    k = min(topk, n_nodes)
 
-    # degree (out-degree per node)
+    # --- build row-normalized transition matrix M on GPU ---
     uni, count = torch.unique(tkg[:, 0], return_counts=True)
-    id_c = torch.stack([torch.arange(n_nodes), torch.arange(n_nodes)]).cuda()
-    val_c = torch.zeros(n_nodes).cuda()
+    id_c = torch.stack([torch.arange(n_nodes, device=device),
+                        torch.arange(n_nodes, device=device)])
+    val_c = torch.zeros(n_nodes, device=device)
     val_c[uni] = 1.0 / count.float()
-    cnt = torch.sparse_coo_tensor(id_c, val_c, (n_nodes, n_nodes)).cuda()
+    cnt = torch.sparse_coo_tensor(id_c, val_c, (n_nodes, n_nodes), device=device)
 
-    # adjacency (head -> tail)
-    index = torch.stack([tkg[:, 0], tkg[:, 2]]).cuda()
-    value = torch.ones(len(tkg)).cuda()
-    Mkg = torch.sparse_coo_tensor(index, value, (n_nodes, n_nodes)).cuda()
+    index = torch.stack([tkg[:, 0], tkg[:, 2]])
+    value = torch.ones(len(tkg), device=device)
+    Mkg = torch.sparse_coo_tensor(index, value, (n_nodes, n_nodes), device=device)
 
-    # M = Mkg * diag(1/degree) -> row-normalized transition
-    M = torch.sparse.mm(Mkg, cnt).cuda()
+    M = torch.sparse.mm(Mkg, cnt)
 
-    print('PPR: transition matrix ready, starting power iteration ...')
+    print('PPR: transition matrix ready (GPU), starting power iteration ...')
     s_time = time.time()
 
     n_batch = n_users // batch_size + (n_users % batch_size > 0)
-    final_rank = torch.zeros(n_nodes, n_users)
+    # accumulate sparse top-k results on CPU
+    all_indices = torch.zeros(n_users, k, dtype=torch.long)
+    all_values  = torch.zeros(n_users, k)
 
-    for i in tqdm(range(n_batch), desc='PPR'):
+    for i in tqdm(range(n_batch), desc='PPR (GPU)'):
         start = i * batch_size
         tbs = min(batch_size, n_users - start)
-        u_list = torch.arange(start, start + tbs)
+        u_list = torch.arange(start, start + tbs, device=device)
 
-        # initial rank: one-hot on user nodes
-        u_index = torch.stack([u_list.cuda(), torch.arange(tbs).cuda()])
-        u_value = torch.ones(tbs).cuda()
-        rank = torch.sparse_coo_tensor(u_index, u_value, (n_nodes, tbs)).cuda()
+        # initial rank: one-hot on user nodes (GPU)
+        u_index = torch.stack([u_list, torch.arange(tbs, device=device)])
+        u_value = torch.ones(tbs, device=device)
+        rank = torch.sparse_coo_tensor(u_index, u_value, (n_nodes, tbs),
+                                       device=device)
 
-        # preference / teleport vector P (biased toward known items)
+        # preference / teleport vector P on GPU
+        node_ids = torch.arange(n_nodes, device=device)
         p_indices_list = []
         p_values_list = []
         for j in range(tbs):
-            uid = u_list[j].item()
+            uid = (start + j)
             known = loader.known_user_set.get(uid, [])
             n_known = len(known)
 
-            node_ids = torch.arange(n_nodes)
-            col_ids = torch.full((n_nodes,), j, dtype=torch.long)
+            col_ids = torch.full((n_nodes,), j, dtype=torch.long, device=device)
 
-            vals = torch.full((n_nodes,), (1 - beta) / max(n_nodes - n_known, 1))
+            vals = torch.full((n_nodes,), (1 - beta) / max(n_nodes - n_known, 1),
+                              device=device)
             if n_known > 0:
-                known_t = torch.LongTensor(known)
+                known_t = torch.LongTensor(known).to(device)
                 vals[known_t] = beta / n_known
 
             p_indices_list.append(torch.stack([node_ids, col_ids]))
             p_values_list.append(vals)
 
-        p_index = torch.cat(p_indices_list, dim=1).cuda()
-        p_value = torch.cat(p_values_list).cuda()
-        P = torch.sparse_coo_tensor(p_index, p_value, (n_nodes, tbs)).coalesce().cuda()
+        p_index = torch.cat(p_indices_list, dim=1)
+        p_value = torch.cat(p_values_list)
+        P = torch.sparse_coo_tensor(p_index, p_value, (n_nodes, tbs),
+                                    device=device).coalesce()
 
-        # power iteration
+        # power iteration (all on GPU)
         for _ in range(n_iter):
             rank = (1 - alpha) * P + alpha * torch.sparse.mm(M, rank)
 
-        final_rank[:, start:start + tbs] = rank.to_dense().cpu()
+        # top-k per user on GPU, then move to CPU
+        rank_dense = rank.to_dense().T  # [tbs, n_nodes], GPU
+        batch_vals, batch_idx = torch.topk(rank_dense, k, dim=1)
+        all_indices[start:start + tbs] = batch_idx.cpu()
+        all_values[start:start + tbs]  = batch_vals.cpu()
 
-    ppr = final_rank.T  # [n_users, n_nodes]
-    print(f'PPR done. time: {time.time() - s_time:.1f}s')
-    return ppr
-
-
-def truncate_topk(ppr, topk):
-    """Keep only top-k scores per user (row).
-
-    Parameters
-    ----------
-    ppr  : Tensor [n_users, n_nodes]  dense
-    topk : int
-
-    Returns
-    -------
-    topk_indices : LongTensor [n_users, topk]   node ids
-    topk_values  : Tensor     [n_users, topk]   PPR scores
-    """
-    k = min(topk, ppr.shape[1])
-    values, indices = torch.topk(ppr, k, dim=1)  # both [n_users, k]
-    return indices, values
-
-
-def build_lookup(topk_indices, topk_values, n_nodes):
-    """Build a fast lookup dict: ppr_lookup[user] -> {node_id: score}.
-
-    This is compact: each user stores at most topk entries.
-    """
-    n_users = topk_indices.shape[0]
-    lookup = {}
-    for u in range(n_users):
-        idx = topk_indices[u]
-        val = topk_values[u]
-        lookup[u] = dict(zip(idx.tolist(), val.tolist()))
-    return lookup
+    print(f'PPR done (GPU). time: {time.time() - s_time:.1f}s')
+    return all_indices, all_values
 
 
 def get_ppr_cached(loader, topk, cache_dir=None):
-    """Load top-k PPR from cache, or compute, truncate, and save.
+    """Load top-k PPR from cache, or compute on GPU and save CPU tensors.
 
     Cache file: ``<cache_dir>/ppr_topk{topk}.pt``
-    Stores only (topk_indices, topk_values) — sparse per-user top-k.
+    Stores only (topk_indices, topk_values) on CPU — sparse per-user top-k.
 
     Returns
     -------
-    topk_indices : LongTensor [n_users, topk]
-    topk_values  : Tensor     [n_users, topk]
+    topk_indices : LongTensor [n_users, topk]  (CPU)
+    topk_values  : Tensor     [n_users, topk]  (CPU)
     """
     if cache_dir is None:
         cache_dir = os.path.join(loader.task_dir, 'ppr_cache')
@@ -145,10 +129,9 @@ def get_ppr_cached(loader, topk, cache_dir=None):
             return ti, tv
         print('PPR: cache shape mismatch, recomputing ...')
 
-    ppr = compute_ppr(loader)
-    topk_indices, topk_values = truncate_topk(ppr, topk)
+    topk_indices, topk_values = compute_ppr(loader, topk=topk)
 
     torch.save({'topk_indices': topk_indices, 'topk_values': topk_values}, cache_path)
-    print(f'PPR: cached top-{topk} to {cache_path}  '
+    print(f'PPR: cached top-{topk} (CPU) to {cache_path}  '
           f'(size: {os.path.getsize(cache_path) / 1024 / 1024:.1f} MB)')
     return topk_indices, topk_values
