@@ -21,6 +21,50 @@ from torch_scatter import scatter
 
 
 # ---------------------------------------------------------------------------
+# PPR edge-pruning helpers
+# ---------------------------------------------------------------------------
+def _variadic_topk_mask(scores, counts, k):
+    """Vectorised per-group top-k over a *flat* scores tensor.
+
+    Parameters
+    ----------
+    scores : Tensor [N]          flat, groups arranged consecutively
+    counts : LongTensor [G]      size of each group (sums to N)
+    k      : int                 top-k budget per group
+
+    Returns
+    -------
+    mask : BoolTensor [N]  True for the kept elements
+    """
+    n_groups = len(counts)
+    max_count = counts.max().item()
+    actual_k = min(k, max_count)
+
+    # pad to [G, max_count] for batched topk
+    padded = torch.full((n_groups, max_count), float('-inf'), device=scores.device)
+    group_idx = torch.repeat_interleave(
+        torch.arange(n_groups, device=scores.device), counts,
+    )
+    offsets = torch.zeros(n_groups, dtype=torch.long, device=scores.device)
+    if n_groups > 1:
+        offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+    pos_in_group = torch.arange(len(scores), device=scores.device) - \
+        torch.repeat_interleave(offsets, counts)
+    padded[group_idx, pos_in_group] = scores
+
+    _, topk_cols = torch.topk(padded, actual_k, dim=1)
+
+    # discard positions beyond actual group length
+    valid = topk_cols < counts.unsqueeze(1)
+    flat_offsets = offsets.unsqueeze(1).expand_as(topk_cols)
+    flat_idx = (topk_cols + flat_offsets)[valid]
+
+    mask = torch.zeros(len(scores), dtype=torch.bool, device=scores.device)
+    mask[flat_idx] = True
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # GNN Layer  (one hop of message passing + optional adaptive node sampling)
 # ---------------------------------------------------------------------------
 class GNNLayer(nn.Module):
@@ -179,6 +223,9 @@ class AdaPropRecSys(nn.Module):
         self.n_edge_topk = params.n_edge_topk
         self.loader      = loader
 
+        # PPR edge-pruning budget (0 = disabled)
+        self.ppr_k = getattr(params, 'ppr_topk', 0)
+
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act  = acts[params.act]
 
@@ -204,6 +251,74 @@ class AdaPropRecSys(nn.Module):
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
         self.gate    = nn.GRU(self.hidden_dim, self.hidden_dim)
 
+    # ---- PPR helpers ----------------------------------------------------
+    def set_ppr(self, ppr_indices, ppr_values):
+        """Register cached top-k PPR data as model buffers (auto-move to CUDA)."""
+        self.register_buffer('ppr_indices', ppr_indices.long())
+        self.register_buffer('ppr_values', ppr_values.float())
+
+    def _lookup_ppr(self, q_users, tail_nodes):
+        """Sparse lookup: PPR[user, node] using cached top-k per user.
+
+        Returns 0 for (user, node) pairs not in the cached top-k.
+        """
+        user_topk_nodes = self.ppr_indices[q_users]   # [E, topk]
+        user_topk_vals  = self.ppr_values[q_users]     # [E, topk]
+        match = (user_topk_nodes == tail_nodes.unsqueeze(1))  # [E, topk]
+        return (user_topk_vals * match.float()).sum(dim=1)     # [E]
+
+    def _ppr_prune_edges(self, q_sub, edges, nodes, old_nodes_new_idx):
+        """Prune edges with PPR: each source node keeps top-k neighbours.
+
+        Self-loop edges are never pruned.
+        """
+        self_rel_id = 2 * self.n_rel + 2
+
+        is_selfloop = (edges[:, 2] == self_rel_id)
+        nsl_idx = torch.where(~is_selfloop)[0]
+        sl_idx  = torch.where(is_selfloop)[0]
+
+        if nsl_idx.numel() == 0:
+            return edges, nodes, old_nodes_new_idx
+
+        nsl_edges = edges[nsl_idx]
+
+        # PPR score for every non-self-loop edge
+        q_users   = q_sub[nsl_edges[:, 0]]
+        tails     = nsl_edges[:, 3]
+        ppr_scores = self._lookup_ppr(q_users, tails)
+
+        # group by (batch_idx, head_node) — one group per source node
+        group_keys = nsl_edges[:, 0] * self.n_nodes + nsl_edges[:, 1]
+        sort_perm  = torch.argsort(group_keys)
+        sorted_keys   = group_keys[sort_perm]
+        sorted_scores = ppr_scores[sort_perm]
+
+        _, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+        keep_mask = _variadic_topk_mask(sorted_scores, counts, self.ppr_k)
+
+        # map kept positions back to original edge ordering
+        kept_nsl_original = nsl_idx[sort_perm[keep_mask]]
+
+        # recombine with self-loops
+        kept_idx = torch.cat([kept_nsl_original, sl_idx]).sort().values
+        edges = edges[kept_idx]
+
+        # recompute tail nodes & tail index
+        new_tail_nodes, new_tail_index = torch.unique(
+            edges[:, [0, 3]], dim=0, sorted=True, return_inverse=True,
+        )
+        edges = torch.cat([edges[:, :5], new_tail_index.unsqueeze(1)], dim=1)
+
+        # recompute old_nodes_new_idx via self-loop edges
+        idd_mask = (edges[:, 2] == self_rel_id)
+        head_idx_sl = edges[idd_mask, 4]
+        tail_idx_sl = edges[idd_mask, 5]
+        _, sort_old = head_idx_sl.sort()
+        new_old_nodes_new_idx = tail_idx_sl[sort_old]
+
+        return edges, new_tail_nodes, new_old_nodes_new_idx
+
     def updateTopkNums(self, topk_list):
         assert len(topk_list) == self.n_layer
         for idx in range(self.n_layer):
@@ -227,6 +342,13 @@ class AdaPropRecSys(nn.Module):
             nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(
                 nodes.data.cpu().numpy(), n, mode=mode,
             )
+
+            # PPR edge pruning for middle layers (layer 1 … n_layer-2)
+            if self.ppr_k > 0 and 0 < i < self.n_layer - 1:
+                edges, nodes, old_nodes_new_idx = self._ppr_prune_edges(
+                    q_sub, edges, nodes, old_nodes_new_idx,
+                )
+
             n_node = nodes.size(0)
 
             layer_out = self.gnn_layers[i](

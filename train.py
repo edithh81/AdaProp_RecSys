@@ -31,6 +31,8 @@ parser.add_argument('--layers', type=int, default=3,
                     help='Number of GNN propagation layers')
 parser.add_argument('--tau', type=float, default=1.0,
                     help='Gumbel-softmax temperature for adaptive sampling')
+parser.add_argument('--ppr_topk', type=int, default=0,
+                    help='PPR edge-pruning top-k per node (0=disabled)')
 parser.add_argument('--epoch', type=int, default=40)
 parser.add_argument('--scheduler', type=str, default='exp')
 parser.add_argument('--weight', type=str, default=None,
@@ -180,6 +182,7 @@ if __name__ == '__main__':
     # AdaProp-specific: per-layer topk budget
     opts.n_node_topk = [args.topk] * opts.n_layer
     opts.n_edge_topk = -1          # no edge sampling by default
+    opts.ppr_topk    = args.ppr_topk
 
     # ---- output dirs ----
     checkPath('./results/')
@@ -200,6 +203,13 @@ if __name__ == '__main__':
 
     # ---- model ----
     model = BaseModel(opts, loader)
+
+    # ---- PPR edge pruning (compute / load cached) ----
+    if opts.ppr_topk > 0:
+        from ppr import get_ppr_cached
+        ppr_indices, ppr_values = get_ppr_cached(loader, topk=opts.ppr_topk)
+        model.model.set_ppr(ppr_indices, ppr_values)
+        print(f'PPR edge pruning enabled: top-{opts.ppr_topk} per node')
 
     if args.weight is not None:
         model.loadModel(args.weight)
