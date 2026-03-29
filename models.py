@@ -253,9 +253,14 @@ class AdaPropRecSys(nn.Module):
 
     # ---- PPR helpers ----------------------------------------------------
     def set_ppr(self, ppr_indices, ppr_values):
-        """Register cached top-k PPR data as model buffers (auto-move to CUDA)."""
-        self.register_buffer('ppr_indices', ppr_indices.long())
-        self.register_buffer('ppr_values', ppr_values.float())
+        """Register cached top-k PPR data as model buffers on the current device.
+
+        Buffers registered after .to(device) are NOT auto-moved, so we
+        explicitly place them on the same device as the model parameters.
+        """
+        device = next(self.parameters()).device
+        self.register_buffer('ppr_indices', ppr_indices.long().to(device))
+        self.register_buffer('ppr_values', ppr_values.float().to(device))
 
     def _lookup_ppr(self, q_users, tail_nodes):
         """Sparse lookup: PPR[user, node] using cached top-k per user.
